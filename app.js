@@ -1,128 +1,168 @@
-let dbInstance = null;
+// URL pública publicada de la pestaña PWA_Export (gid=1209965672)
+const CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTlJjr1jKCHJ2CPjYH5WxzF8WRtbe5tLqODValC7vsfHiTWAhNV9KFajakURDudWKbNeHaWhtHPgVP8/pub?gid=1209965672&single=true&output=csv';
+
 let rawData = [];
 
-const btnSync = document.getElementById('btn-sync');
 const statusBar = document.getElementById('status-bar');
 const tableBody = document.getElementById('table-body');
 const searchInput = document.getElementById('search-input');
 
-// Cargar motor SQL.js
-async function initSQLite() {
-  const SQL = await initSqlJs({
-    locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/${file}`
-  });
-  return SQL;
-}
-
-// Cargar la BD desde la raíz de GitHub Pages
-async function cargarBD() {
+async function autoCargarDatosSheets() {
   try {
-    statusBar.textContent = "⏳ Descargando base de datos SQLite...";
-    btnSync.disabled = true;
+    if (statusBar) statusBar.textContent = "⏳ Cargando datos en vivo...";
 
-    const response = await fetch('acciones_crecimiento.db');
-    if (!response.ok) throw new Error("No se encontró el archivo 'acciones_crecimiento.db'");
-    
-    const buffer = await response.arrayBuffer();
-    const SQL = await initSQLite();
-    dbInstance = new SQL.Database(new Uint8Array(buffer));
+    // URL con timestamp para evitar la caché del navegador
+    const urlSinCache = `${CSV_URL}&_ts=${Date.now()}`;
+    const response = await fetch(urlSinCache, {
+      cache: 'no-store',
+      headers: {
+        'Pragma': 'no-cache',
+        'Cache-Control': 'no-cache'
+      }
+    });
 
-    statusBar.textContent = "✅ Base de datos cargada correctamente.";
-    btnSync.disabled = false;
-    
-    procesarEscaneo();
-  } catch (err) {
-    statusBar.textContent = `❌ Error: ${err.message}`;
-    btnSync.disabled = false;
-  }
-}
-
-// Procesar y calificar activos
-function procesarEscaneo() {
-  if (!dbInstance) return;
-
-  const query = `
-    SELECT Ticker, Sector, LastClose, EMA20, SMA50, RevenueGrowth_YoY 
-    FROM universo_filtrado
-  `;
-  
-  const res = dbInstance.exec(query);
-  if (res.length === 0) {
-    tableBody.innerHTML = `<tr><td colspan="8" class="text-center">No se encontraron registros.</td></tr>`;
-    return;
-  }
-
-  const columns = res[0].columns;
-  const values = res[0].values;
-
-  rawData = values.map(row => {
-    const obj = {};
-    columns.forEach((col, i) => obj[col] = row[i]);
-    
-    const close = obj.LastClose;
-    const ema20 = obj.EMA20;
-    const sma50 = obj.SMA50;
-
-    const distEMA20 = ((close - ema20) / ema20) * 100;
-    const distSMA50 = ((close - sma50) / sma50) * 100;
-
-    let estado = "⌛ EN ESPERA";
-    let badgeClass = "badge-espera";
-
-    if (distEMA20 >= -1.5 && distEMA20 <= 0.5 && distSMA50 > 0) {
-      estado = "🎯 ENTRADA IDEAL";
-      badgeClass = "badge-ideal";
-    } else if (distEMA20 > 0.5 && distEMA20 <= 2.0 && distSMA50 > 0) {
-      estado = "🚀 REBOTE / MOMENTUM";
-      badgeClass = "badge-rebote";
-    } else if (distEMA20 > 5.0) {
-      estado = "⚠️ SOBREEXTENDIDO";
-      badgeClass = "badge-sobre";
-    } else if (distEMA20 < -2.0) {
-      estado = "🔍 SOPORTE SMA50";
-      badgeClass = "badge-soporte";
+    if (!response.ok) {
+      throw new Error(`Error HTTP ${response.status}: No se pudo descargar la pestaña PWA_Export.`);
     }
 
-    return {
-      ticker: obj.Ticker,
-      sector: obj.Sector || 'N/A',
-      close: close.toFixed(2),
-      ema20: ema20.toFixed(2),
-      distEMA20: distEMA20.toFixed(2),
-      distSMA50: distSMA50.toFixed(2),
-      ventasYoY: ((obj.RevenueGrowth_YoY || 0) * 100).toFixed(1),
-      estado: estado,
-      badgeClass: badgeClass,
-      absDist: Math.abs(distEMA20)
-    };
-  });
+    const csvText = await response.text();
 
-  // Ordenar por cercanía absoluta a la EMA20
-  rawData.sort((a, b) => a.absDist - b.absDist);
+    if (!csvText || csvText.trim() === '') {
+      throw new Error("El archivo CSV está vacío.");
+    }
+
+    const rows = parsearCSVLineaPorLinea(csvText);
+
+    if (rows.length <= 1) {
+      rawData = [];
+      actualizarKPIs([]);
+      renderTabla([]);
+      if (statusBar) statusBar.textContent = "⚠️ Sin activos en PWA_Export. Corre el script de Python.";
+      return;
+    }
+
+    renderizarTablaPWA(rows);
+
+    if (statusBar) {
+      statusBar.textContent = `✅ Sincronizado (${rawData.length} activos) - ${new Date().toLocaleTimeString()}`;
+    }
+
+  } catch (err) {
+    console.error("Error PWA:", err);
+    if (statusBar) statusBar.textContent = `❌ Error: ${err.message}`;
+    if (tableBody) {
+      tableBody.innerHTML = `
+        <tr>
+          <td colspan="8" class="text-center" style="color:#FF7043; padding:20px;">
+            <b>Fallo en la carga:</b> ${err.message}
+          </td>
+        </tr>`;
+    }
+  }
+}
+
+// Parser CSV robusto con soporte para comillas y comas entre valores
+function parsearCSVLineaPorLinea(text) {
+  const lines = text.split(/\r?\n/).filter(line => line.trim() !== '');
+  if (lines.length === 0) return [];
+
+  return lines.map(line => {
+    let result = [];
+    let cell = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      let c = line[i];
+      if (c === '"') {
+        inQuotes = !inQuotes;
+      } else if (c === ',' && !inQuotes) {
+        result.push(cell.trim());
+        cell = '';
+      } else {
+        cell += c;
+      }
+    }
+    result.push(cell.trim());
+    return result;
+  });
+}
+
+function renderizarTablaPWA(rows) {
+  const dataRows = rows.slice(1);
+
+  rawData = dataRows.map(row => {
+    if (row.length < 8) return null;
+
+    const ticker = row[0].replace(/^"|"$/g, '');
+    const sector = row[1].replace(/^"|"$/g, '');
+
+    // Normalizar formato de números (soporta comas o puntos decimales)
+    const cleanNum = (v) => parseFloat(v.replace(',', '.').replace(/[^0-9.-]/g, '')) || 0;
+
+    const precio = cleanNum(row[2]).toFixed(2);
+    const ema20 = cleanNum(row[3]).toFixed(2);
+    const distEMA20 = cleanNum(row[4]);
+    const distSMA50 = cleanNum(row[5]);
+    const ventasYoY = cleanNum(row[6]).toFixed(1);
+    const estado = row[7].replace(/^"|"$/g, '') || '⌛ EN ESPERA';
+
+    let badgeClass = "badge-espera";
+    if (estado.includes("IDEAL")) badgeClass = "badge-ideal";
+    else if (estado.includes("REBOTE") || estado.includes("MOMENTUM")) badgeClass = "badge-rebote";
+    else if (estado.includes("SOBREEXTENDIDO")) badgeClass = "badge-sobre";
+    else if (estado.includes("SOPORTE")) badgeClass = "badge-soporte";
+
+    return {
+      ticker,
+      sector,
+      precio,
+      ema20,
+      distEMA20,
+      distSMA50,
+      ventasYoY,
+      estado,
+      badgeClass
+    };
+  }).filter(item => item !== null);
 
   actualizarKPIs(rawData);
   renderTabla(rawData);
 }
 
 function actualizarKPIs(data) {
-  document.getElementById('kpi-total').textContent = data.length;
-  document.getElementById('kpi-ideal').textContent = data.filter(d => d.estado.includes("IDEAL")).length;
-  document.getElementById('kpi-momentum').textContent = data.filter(d => d.estado.includes("REBOTE")).length;
-  document.getElementById('kpi-sobre').textContent = data.filter(d => d.estado.includes("SOBREEXTENDIDO")).length;
+  const elTotal = document.getElementById('kpi-total');
+  const elIdeal = document.getElementById('kpi-ideal');
+  const elMomentum = document.getElementById('kpi-momentum');
+  const elSobre = document.getElementById('kpi-sobre');
+
+  if (elTotal) elTotal.textContent = data.length;
+  if (elIdeal) elIdeal.textContent = data.filter(d => d.estado.includes("IDEAL")).length;
+  if (elMomentum) elMomentum.textContent = data.filter(d => d.estado.includes("REBOTE") || d.estado.includes("MOMENTUM")).length;
+  if (elSobre) elSobre.textContent = data.filter(d => d.estado.includes("SOBREEXTENDIDO")).length;
 }
 
 function renderTabla(data) {
+  if (!tableBody) return;
   tableBody.innerHTML = "";
-  
+
+  if (data.length === 0) {
+    tableBody.innerHTML = `<tr><td colspan="8" class="text-center">No hay activos registrados.</td></tr>`;
+    return;
+  }
+
   data.forEach(item => {
     const tr = document.createElement('tr');
+
+    const distEMAStr = (item.distEMA20 > 0 ? '+' : '') + item.distEMA20.toFixed(2) + '%';
+    const distSMAStr = (item.distSMA50 > 0 ? '+' : '') + item.distSMA50.toFixed(2) + '%';
+
     tr.innerHTML = `
       <td><b>${item.ticker}</b></td>
       <td>${item.sector}</td>
-      <td>$${item.close}</td>
+      <td>$${item.precio}</td>
       <td>$${item.ema20}</td>
-      <td style="color:${item.distEMA20 >= 0 ? '#2ECC71' : '#FF7043'}">${item.distEMA20 > 0 ? '+' : ''}${item.distEMA20}%</td>
-      <td style="color:${item.distSMA50 >= 0 ? '#2ECC71' : '#FF7043'}">${item.distSMA50 > 0 ? '+' : ''}${item.distSMA50}%</td>
+      <td style="color:${item.distEMA20 >= 0 ? '#2ECC71' : '#FF7043'}">${distEMAStr}</td>
+      <td style="color:${item.distSMA50 >= 0 ? '#2ECC71' : '#FF7043'}">${distSMAStr}</td>
       <td>${item.ventasYoY}%</td>
       <td><span class="badge ${item.badgeClass}">${item.estado}</span></td>
     `;
@@ -130,14 +170,18 @@ function renderTabla(data) {
   });
 }
 
-// Búsqueda interactiva
-searchInput.addEventListener('input', (e) => {
-  const query = e.target.value.toLowerCase();
-  const filtered = rawData.filter(d => 
-    d.ticker.toLowerCase().includes(query) || 
-    d.sector.toLowerCase().includes(query)
-  );
-  renderTabla(filtered);
-});
+// Filtro de búsqueda en vivo
+if (searchInput) {
+  searchInput.addEventListener('input', (e) => {
+    const query = e.target.value.toLowerCase();
+    const filtered = rawData.filter(d => 
+      d.ticker.toLowerCase().includes(query) || 
+      d.sector.toLowerCase().includes(query)
+    );
+    renderTabla(filtered);
+  });
+}
 
-btnSync.addEventListener('click', cargarBD);
+// Escuchadores de eventos para sincronización automática
+document.addEventListener('DOMContentLoaded', autoCargarDatosSheets);
+window.addEventListener('focus', autoCargarDatosSheets);
