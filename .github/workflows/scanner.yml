@@ -1,0 +1,38 @@
+name: QuantGrowth Daily Scanner
+
+on:
+  schedule:
+    # Corre de lunes a viernes a las 21:00 UTC (4:00 PM EST - Cierre de NYSE)
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch: # Permite ejecución manual desde la web
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar Código del Repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas yfinance gspread google-auth requests urllib3
+
+      - name: Reconstruir credentials.json
+        run: |
+          echo '${{ secrets.GCP_CREDENTIALS }}' > credentials.json
+
+      - name: Ejecutar Escáner QuantGrowth
+        run: |
+          python exportar_sheets.py
+
+      - name: Limpiar credenciales temporales
+        if: always()
+        run: |
+          rm -f credentials.json
